@@ -1,0 +1,504 @@
+---
+sidebar_position: 1
+---
+
+# Pourquoi Hullbay
+
+:::info Note de nommage
+Hullbay est le nom du produit. En interne, le code source — les noms de packages
+(`@bozando-ops/*`), l'espace de noms des labels Docker (`bozando.*`) et le nom de
+base de données par défaut (`bozando_ops`) — utilise encore l'ancien identifiant
+`bozando-ops`, antérieur au changement de nom. C'est volontaire pour l'instant :
+renommer chaque label sur chaque ressource de chaque cluster déjà en production
+serait une migration cassante, pas un simple choix de documentation. Les extraits de
+code de cette page reflètent donc les identifiants réels et actuels du dépôt.
+:::
+
+## Le problème avec Docker Swarm aujourd'hui
+
+Docker Swarm offre du clustering natif, de l'équilibrage de charge (le routing
+mesh), des mises à jour progressives et de l'auto-guérison — tout cela intégré au
+moteur Docker que vous utilisez déjà, sans control plane supplémentaire à installer.
+C'est le chemin le plus simple vers « plus d'un serveur » pour une petite équipe ou
+un opérateur solo.
+
+Le problème n'est pas Swarm en lui-même. Le problème, c'est **tout ce que Swarm ne
+fournit pas** :
+
+- **Pas de topologie visuelle.** Swarm ne connaît les services, réseaux et volumes
+  que comme des listes plates. Il n'a aucune notion de « ce conteneur parle à cette
+  base de données via ce réseau » — comprendre une stack revient à lire la sortie de
+  `docker service ls` et à reconstruire le graphe mentalement.
+- **Pas de diff avant application.** `docker service update` ou `docker stack
+deploy` s'exécutent immédiatement. Il n'existe aucune étape native « voici ce qui
+  va changer » avant qu'un service de production ne soit recréé.
+- **Pas d'auto-scaling.** Swarm maintient un nombre _fixe_ de replicas par service,
+  plus une auto-guérison si une tâche meurt. Il ne scalera jamais un service à la
+  hausse sous charge de lui-même.
+- **Une source de vérité fragile.** La plupart des outils construits au-dessus de
+  Swarm stockent l'état désiré dans une base de données. Si cette base est perdue,
+  l'infrastructure « désirée » disparaît, même si les conteneurs continuent de
+  tourner normalement.
+- **La délégation est pensée après coup.** Donner à un collègue un accès limité
+  (« peut déployer, mais ne touche pas à la facturation/aux serveurs ») se traduit
+  généralement par du bricolage de clés SSH, en espérant que personne ne lance un
+  `docker system prune -a` en production.
+- **Le socket Docker, c'est root.** Tout outil qui parle directement à
+  `/var/run/docker.sock` a, en pratique, un accès root sur l'hôte. Très peu d'outils
+  d'ops self-hosted traitent cela comme le problème de sécurité de premier plan
+  qu'il est réellement.
+
+Les outils existants résolvent _certains_ de ces points. Portainer offre une
+interface mais pas de canvas de topologie ni de workflow diff-avant-application.
+Rancher cible Kubernetes, un engagement opérationnel bien plus lourd qu'un cluster
+Swarm à deux VPS. Coolify et CapRover optimisent pour des déploiements PaaS
+mono-serveur, pas pour du Swarm multi-nœuds avec une visualisation réseau.
+
+**Hullbay** a été construit spécifiquement pour combler ces manques, pour les
+équipes et opérateurs solo qui ont choisi Swarm _pour_ sa simplicité, et qui ne
+veulent pas sacrifier cette simplicité pour obtenir une bonne expérience
+opérationnelle.
+
+Les sections suivantes détaillent, concrètement, comment chaque manque est comblé.
+
+---
+
+## Un canvas visuel façon GNS3
+
+La plupart des interfaces Docker self-hosted présentent votre infrastructure sous
+forme de **listes** : une liste de conteneurs, une liste de réseaux, une liste de
+volumes. Comprendre leurs relations demande de garder la topologie en tête.
+
+Hullbay représente au contraire un projet comme un **graphe que vous dessinez**,
+construit sur [React Flow](https://reactflow.dev/) (`@xyflow/react`), dans le même
+esprit que les simulateurs réseau comme GNS3 : les nœuds sont des composants, les
+liens sont les relations entre eux.
+
+### Les quatre types de nœuds
+
+Chaque projet est composé de quatre types de nœuds
+(`packages/shared/src/node-config.ts`), chacun avec sa propre icône et son propre
+formulaire de configuration :
+
+| Type        | Représente                                               | Icône            |
+| ----------- | -------------------------------------------------------- | ---------------- |
+| `container` | Un service Docker Swarm (une image en cours d'exécution) | Cube             |
+| `network`   | Un réseau Docker overlay/bridge                          | Pile de serveurs |
+| `volume`    | Stockage persistant (géré ou externe)                    | Pile de disques  |
+| `gateway`   | Exposition publique sur internet via Caddy               | Globe            |
+
+### Une matrice de connexion stricte, appliquée des deux côtés
+
+Toutes les paires de types de nœuds n'ont pas de sens à connecter — un volume ne
+peut pas parler à une gateway, et deux réseaux ne peuvent pas être reliés
+directement entre eux. Plutôt que de laisser l'interface réinterpréter
+silencieusement une connexion invalide, Hullbay définit une **source de vérité
+unique et partagée** pour ce qui est autorisé :
+
+```ts
+// packages/shared/src/node-config.ts
+const CONNECTION_RULES: { a: NodeType; b: NodeType; kind: EdgeKindLiteral }[] =
+  [
+    { a: "container", b: "network", kind: "network" },
+    { a: "container", b: "volume", kind: "volume" },
+    { a: "container", b: "gateway", kind: "gateway" },
+  ];
+```
+
+Cette même table est importée par :
+
+- Le **frontend**, pour bloquer les glissers-déposer invalides au moment de
+  `isValidConnection` (`CanvasPage.tsx`), avec un message clair — _« container ne
+  peut pas se relier directement à gateway »_ — si un glisser est relâché sur une
+  cible invalide.
+- Le **backend**, dans `ProjectsService.createEdge`, en défense en profondeur :
+  même si quelque chose contourne l'interface, l'API redérive indépendamment le
+  `kind` attendu pour la paire et rejette toute incohérence.
+
+Comme les deux côtés importent exactement la même fonction depuis
+`@bozando-ops/shared`, il n'y a **aucun risque de dérive** entre ce que le canvas
+autorise à dessiner et ce que l'API acceptera réellement.
+
+### Pas seulement du glisser-déposer — accessible par conception
+
+La palette qui ajoute des nœuds au canvas prend en charge deux voies
+délibérément, documentées directement dans le composant :
+
+- **Glisser** (souris) : le glisser-déposer HTML5 classique, déposé à la position
+  du curseur.
+- **Clic / clavier** (`Entrée` / `Espace`) : ajoute le nœud au centre de la zone
+  visible du canvas — car le glisser HTML5 seul est inutilisable au clavier et peu
+  fiable sur écran tactile.
+
+```tsx
+// packages/web/src/canvas/Palette.tsx
+role="button"
+tabIndex={0}
+aria-label={`Ajouter ${label} : ${hint}`}
+draggable
+onClick={() => onAdd(type)}
+onKeyDown={(e) => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onAdd(type) }
+}}
+```
+
+### Un état en direct, pas un diagramme statique
+
+Le canvas n'est pas qu'une surface de conception — il reflète la **réalité** en
+temps réel via une connexion WebSocket (`useOpsSocket`, chemin `/ws`) :
+
+- Chaque nœud conteneur affiche une pastille d'état colorée et labellisée
+  (`running`, `exited`, `missing`...) qui se met à jour en direct dès que Docker
+  émet un événement, capté par l'observateur (voir la Reconciliation dans les
+  Concepts Fondamentaux).
+- Les services multi-replicas s'affichent comme une **pile visuelle** de cartes
+  décalées avec un badge `×N` — le nombre affiché est le compte **réel, mesuré** de
+  tâches en cours d'exécution, pas le nombre de replicas désiré dans la config :
+  une boucle de crash ou une mise à jour progressive est donc visible
+  immédiatement, plutôt que cachée derrière un badge statique « 3 replicas ».
+- Les nœuds gateway affichent un état dérivé — `online`, `offline` (cible
+  injoignable) ou `pending` — plutôt qu'un état de cycle de vie de conteneur,
+  puisqu'une route Caddy n'a pas de notion propre de « running/exited ».
+
+### Pourquoi cela compte
+
+Le canvas n'est pas un gadget ici — il réduit directement deux classes
+d'incidents de production courants avec les interfaces Docker en liste : connecter
+le mauvais service au mauvais réseau, et ne pas remarquer qu'un conteneur supprimé
+du graphe tourne encore silencieusement dans Docker. Les deux sont visibles d'un
+coup d'œil sur le canvas, et les règles de connexion empêchent la première classe
+d'erreur d'être seulement possible.
+
+---
+
+## Docker comme source de vérité
+
+Presque toutes les plateformes d'ops construites sur Docker conservent l'état
+« désiré » de l'infrastructure dans leur propre base de données. Si cette base est
+perdue — une mauvaise migration, un volume supprimé, une restauration ratée —
+l'outil ne sait plus ce qui _devrait_ exister, même si les conteneurs continuent de
+tourner parfaitement dans Docker.
+
+Hullbay inverse cette relation. Comme indiqué directement dans le code source :
+
+> PostgreSQL est un **cache de confort**. La source de vérité redondante de l'état
+> désiré déployé vit dans les labels Docker (`bozando.*`). `rebuildFromDocker()`
+> peut reconstruire ces tables depuis Docker seul.
+> — `packages/api/prisma/schema.prisma`
+
+### Ce qui est réellement stocké dans les labels
+
+Chaque ressource gérée (service, réseau, volume) est étiquetée avec un jeu complet
+de labels `bozando.*` (`packages/shared/src/labels.ts`), notamment :
+
+| Label                                                      | Rôle                                                                                      |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `bozando.managed`                                          | Marque la ressource comme appartenant à Hullbay                                           |
+| `bozando.system`                                           | Marque l'infrastructure cœur (jamais touchée par le prune ou les opérations destructives) |
+| `bozando.projectId` / `bozando.projectSlug`                | À quel projet cette ressource appartient                                                  |
+| `bozando.nodeId` / `bozando.nodeName` / `bozando.nodeType` | Identité du nœud sur le canvas                                                            |
+| `bozando.canvas.x` / `bozando.canvas.y`                    | Position sur le canvas                                                                    |
+| `bozando.desiredHash`                                      | Hash stable de la config désirée, utilisé pour un diff idempotent                         |
+| `bozando.spec`                                             | La **configuration entière du nœud**, encodée en base64(JSON)                             |
+| `bozando.edges`                                            | Un résumé des connexions sortantes de ce nœud, suffisant pour reconstruire les liens      |
+
+Le principe directeur, documenté juste à côté de `LabelKeys` :
+
+> On stocke le **maximum d'informations** dans les labels pour pouvoir reconstruire
+> l'intégralité de l'état désiré depuis Docker seul, même si PostgreSQL est perdu.
+
+Les secrets sont la seule exception délibérée — les _valeurs_ des Docker Secrets
+n'apparaissent jamais dans les labels ni les variables d'environnement, seulement
+une référence (`secretName` + `target` de montage) ; voir la section Secrets &
+Chiffrement de la documentation Sécurité.
+
+### `rebuildFromDocker` : le chemin de récupération
+
+Si Postgres est un jour perdu, effacé, ou simplement désynchronisé, un compte
+`operator` ou supérieur peut appeler :
+
+```
+POST /api/rebuild-from-docker
+```
+
+Cela parcourt chaque service, réseau et volume géré, décode leurs labels
+`bozando.*`, et fait un **upsert** des lignes `Project`, `Node` et `Edge`
+directement depuis ce qui tourne réellement — y compris la position sur le canvas,
+pour que le diagramme ressemble exactement à ce qu'il était avant. Si le label
+`bozando.spec` d'une ressource est illisible pour une raison quelconque, le nœud est
+quand même créé, mais marqué `degraded` pour signaler qu'une vérification manuelle
+de sa configuration est nécessaire plutôt que de le laisser silencieusement faux.
+
+```ts
+// packages/api/src/modules/reconciler/rebuild.ts
+export async function rebuildFromDocker(...): Promise<{
+  projects: number; nodes: number; edges: number; degraded: number
+}>
+```
+
+Ceci est exposé dans l'interface comme un simple bouton **« Reconstruire depuis
+Docker »** sur la page Projets — aucun CLI, aucun SQL manuel.
+
+### Pourquoi c'est un vrai facteur de différenciation
+
+Demandez-vous ce qui arrive à la compréhension qu'un outil concurrent a de votre
+infrastructure si sa base de données disparaît. Dans la plupart des cas, la
+réponse est : rien n'est perdu dans _Docker_, mais l'_outil_, lui, est maintenant
+aveugle — il faut le repointer manuellement vers la réalité, service par service.
+Chez Hullbay, cette récupération tient en un seul bouton, parce que l'état désiré
+n'a jamais été _uniquement_ dans la base de données.
+
+---
+
+## Planifier avant d'appliquer
+
+`docker service update` et `docker stack deploy` modifient tous deux votre cluster
+immédiatement. Il n'existe aucune étape native qui montre _ce qui va changer_ avant
+que cela n'arrive. Sur un cluster partagé, avec un compte `operator` délégué qui
+clique sur « Déployer », c'est un vrai risque.
+
+Hullbay ajoute cette étape manquante comme partie intégrante du flux de
+déploiement — la même idée que `terraform plan`, mais rendue visuellement.
+
+### Deux vérifications avant chaque déploiement
+
+Quand vous cliquez sur **Déployer**, le modal `DeployPlanModal` exécute deux
+vérifications indépendantes et bloque l'action si l'une échoue :
+
+**1. Cohérence du graphe côté client** (`canvas/validate.ts`)
+
+Validation pure, sans dépendance, du graphe que vous avez dessiné, répartie entre
+**erreurs** (bloquent le déploiement) et **avertissements** (informatifs) :
+
+| Vérification                                        | Sévérité      |
+| --------------------------------------------------- | ------------- |
+| Conteneur sans image                                | Erreur        |
+| Gateway sans conteneur connecté                     | Erreur        |
+| Gateway sans domaine                                | Erreur        |
+| Deux conteneurs publiant le même port hôte          | Erreur        |
+| Deux volumes montés au même chemin sur un conteneur | Erreur        |
+| Conteneur relié à aucun réseau                      | Avertissement |
+| Volume monté sur aucun conteneur                    | Avertissement |
+
+**2. Diff côté serveur** (`GET /api/projects/:id/plan`)
+
+Le reconciler compare le `desiredHash` de chaque nœud conteneur avec le label du
+service Swarm réel correspondant et classe chaque service dans exactement une
+catégorie :
+
+```ts
+// packages/api/src/modules/reconciler/service.ts
+export type DiffAction =
+  | { kind: "create"; node: Node }
+  | { kind: "update"; node: Node; existingId: string }
+  | { kind: "noop"; node: Node; existingId: string }
+  | { kind: "remove"; dockerId: string; name: string; type: NodeType };
+```
+
+Le modal affiche cela sous forme de liste colorée — vert **Créer**, orange
+**Mettre à jour**, gris **Inchangé**, rouge **Supprimer** — pour voir exactement
+quels services seront recréés, mis à jour, laissés tels quels, ou détruits, avant
+de confirmer.
+
+### Idempotence, pas de devinette
+
+Le diff n'est pas approximatif. `computeDesiredHash()` produit un hash SHA-256
+stable de `{ type, name, config }` avec les clés triées, stocké comme label
+`bozando.desiredHash` sur le service réel. Si votre graphe n'a pas réellement
+changé, le plan affiche `noop` — cliquer de nouveau sur Déployer est toujours sûr
+et ne déclenche jamais une mise à jour inutile.
+
+### Zéro interruption par défaut en cas de changement
+
+Une action `update` n'est jamais un arrêt-puis-recréation. C'est une véritable
+mise à jour progressive Swarm avec l'ordre `start-first` — la nouvelle tâche
+démarre **avant** que l'ancienne ne soit arrêtée :
+
+```ts
+// packages/api/src/modules/docker-engine/service.ts
+UpdateConfig: {
+  Parallelism: config.updateParallelism,
+  Delay: config.updateDelaySec * 1e9,
+  Order: "start-first" as const,
+  FailureAction: "rollback" as const,
+}
+```
+
+### Rollback complet en cas d'échec partiel
+
+Le déploiement lui-même s'exécute comme une séquence d'étapes — réseaux → volumes
+→ services → gateways — avec une action de compensation pour chacune. Si l'étape 3
+échoue, tout ce qui a été créé aux étapes 1 et 2 durant _ce_ déploiement est
+automatiquement détruit (`deploy-project.ts`), afin qu'un déploiement échoué ne
+laisse jamais de réseau orphelin ou de service à moitié créé.
+
+Résultat : un `operator` délégué voit précisément ce qu'un clic va faire avant que
+cela n'arrive, sur un diff visuel plutôt qu'un mur de sortie
+`docker service inspect` — et si quelque chose échoue en cours de déploiement, le
+workflow défait lui-même son travail partiel plutôt que de laisser le cluster dans
+un état mixte.
+
+---
+
+## La sécurité par défaut, pas par configuration
+
+Contrôler Docker, c'est contrôler l'hôte — l'accès à `docker.sock` équivaut, en
+pratique, à un accès root. La plupart des outils d'ops self-hosted traitent la
+sécurité comme quelque chose qu'on _peut_ activer. Hullbay la traite comme quelque
+chose qu'on ne peut pas désactiver.
+
+### 1. La MFA est obligatoire, pas optionnelle
+
+Chaque compte — y compris le tout premier compte `owner` créé lors du bootstrap —
+est guidé vers l'enrôlement MFA TOTP. Le backend applique cela au niveau de la
+garde de requête, indépendamment du frontend :
+
+```ts
+// packages/api/src/modules/auth/routes.ts
+if (!decoded.mfaEnabled && !MFA_SETUP_PATHS.has(path)) {
+  return reply.code(403).send({ error: "MFA non activée veillez l'activer" });
+}
+```
+
+Seuls les points de terminaison d'enrôlement MFA eux-mêmes (`/mfa/enroll`,
+`/mfa/confirm`, `/me`) sont accessibles avant l'activation de la MFA — toute autre
+route `/api/*` est bloquée avec un 403 tant que le compte n'a pas configuré le
+TOTP. Il n'existe aucune variable d'environnement pour désactiver cela.
+
+La connexion est un véritable flux en deux étapes avec des **audiences JWT
+séparées**, de sorte qu'un jeton pré-MFA volé ne peut jamais être rejoué comme un
+jeton de session complet :
+
+```ts
+// packages/api/src/modules/auth/service.ts
+const AUD_SESSION = "session";
+const AUD_MFA_PENDING = "mfa-pending";
+```
+
+### 2. Le socket Docker n'est jamais exposé directement
+
+En production, l'API ne monte jamais `/var/run/docker.sock`. Elle parle plutôt à
+un conteneur
+[`tecnativa/docker-socket-proxy`](https://github.com/Tecnativa/docker-socket-proxy)
+en TCP, qui n'autorise que la surface pertinente pour Swarm (`SERVICES`,
+`NETWORKS`, `VOLUMES`, `TASKS`, `NODES`, `EVENTS`, `IMAGES`, `SECRETS`) et
+**bloque** explicitement les deux capacités les plus dangereuses :
+
+```yaml
+# docker-compose.prod.yml
+EXEC: 0 # pas d'exec dans les conteneurs
+CONTAINERS: 0 # pas de contrôle brut des conteneurs
+ALLOW_RESTARTS: 0
+```
+
+### 3. Un RBAC pensé dès le départ, pas ajouté après coup
+
+Trois rôles — `viewer < operator < owner` — sont appliqués sur **chaque** route
+mutante via une seule garde `requireRole()`
+(`packages/api/src/modules/auth/rbac.ts`), et la même table de rangs est reflétée
+côté frontend (`useMe().can(minRole)`) pour que l'interface masque ou désactive
+les actions qu'un rôle ne peut pas effectuer, plutôt que de laisser l'utilisateur
+tomber sur un 403 opaque. Le backend reste dans tous les cas la seule autorité
+réelle.
+
+| Rôle       | Peut faire                                                                             |
+| ---------- | -------------------------------------------------------------------------------------- |
+| `viewer`   | Lecture seule : voir les projets, la santé, le drift                                   |
+| `operator` | Tout ce qu'un viewer peut faire, plus déployer/détruire des projets, gérer les secrets |
+| `owner`    | Tout, plus gérer les serveurs, les registres et les comptes utilisateurs               |
+
+Déléguer un accès limité à un employé — la raison d'être affichée de l'outil — est
+un flux de premier ordre : un `owner` crée un compte `operator` ou `viewer` depuis
+l'interface, avec chaque action sur un compte (`user.created`,
+`user.role.changed`, `user.deleted`) écrite dans le journal d'audit.
+
+Deux invariants empêchent le verrouillage complet du système :
+
+```ts
+// packages/api/src/modules/auth/service.ts
+if (user.role === "owner" && role !== "owner") {
+  const owners = await prisma.user.count({ where: { role: "owner" } });
+  if (owners <= 1)
+    throw new Error("impossible de rétrograder le dernier owner");
+}
+```
+
+— on ne peut jamais rétrograder ou supprimer le _dernier_ compte owner, et on ne
+peut jamais supprimer son propre compte en étant connecté avec.
+
+### 4. Les secrets sont chiffrés, et les secrets applicatifs ne touchent jamais un label
+
+- Les secrets MFA, les clés SSH-outil et les tokens de registre sont chiffrés au
+  repos avec **AES-256-GCM** (`packages/api/src/modules/auth/crypto.ts`).
+- Les Docker Secrets applicatifs (par ex. un mot de passe de base de données) sont
+  **write-only** : l'API ne relit et ne réaffiche jamais une valeur une fois
+  posée, et la valeur n'est jamais placée dans un label ni une variable
+  d'environnement.
+- Les logs sont expurgés des champs sensibles (`req.body.password`,
+  `req.body.token`, `req.body.privateKey`, l'en-tête `authorization`, etc.) au
+  niveau du logger Fastify.
+
+### 5. Un garde-fou « œuf-poule » contre l'auto-destruction
+
+Parce que Hullbay peut se déployer lui-même une fois bootstrappé, chaque opération
+Docker destructive (`removeService`, `scaleService`) vérifie d'abord que la cible
+n'est pas labellisée `bozando.system=true` — c'est-à-dire les propres conteneurs
+de l'ops-panel — et refuse si c'est le cas, peu importe qui fait la demande.
+
+Rien de tout cela n'est une cryptographie exotique ou un protocole inédit — ce
+sont des valeurs par défaut disciplinées. C'est précisément le but : l'option la
+plus sûre est aussi la seule option, pour qu'un compte `operator` délégué puisse
+être confié à un collègue junior sans revue de sécurité à chaque fois.
+
+---
+
+## Hullbay face aux autres outils d'ops self-hosted
+
+:::caution Garder cette section à jour
+Les fonctionnalités des concurrents évoluent fréquemment. Chaque ligne ci-dessous
+doit être revérifiée par rapport à la documentation actuelle du concurrent avant
+publication, et une date de « dernière vérification » devrait être ajoutée une
+fois cette page publiée. Rien ici ne devrait être publié sans cette vérification.
+:::
+
+|                                       | **Hullbay**                                                                                                    | Portainer CE                                       | Coolify                            | CapRover                           | Rancher                                                       |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ---------------------------------- | ---------------------------------- | ------------------------------------------------------------- |
+| Cible d'orchestration                 | Docker Swarm (un VPS unique → cluster multi-nœuds)                                                             | Docker / Swarm / Kubernetes                        | Serveur unique/multiple, Docker    | Serveur unique, Docker             | Kubernetes                                                    |
+| Canvas de topologie visuelle          | **Oui** — graphe en glisser-déposer de conteneurs/réseaux/volumes/gateways                                     | Non (basé sur des listes)                          | Non (basé sur des listes)          | Non (basé sur des listes)          | Partiel (vues de ressources K8s, pas un canvas de conception) |
+| Diff / plan avant déploiement         | **Oui** — vérifications de cohérence côté client + diff création/mise à jour/inchangé/suppression côté serveur | Non                                                | Partiel                            | Non                                | Partiel (via des outils GitOps)                               |
+| MFA obligatoire pour tous les comptes | **Oui**, appliquée au niveau de la garde API, sans option de désactivation                                     | Optionnelle                                        | Optionnelle                        | Non intégrée                       | Dépend du fournisseur d'authentification                      |
+| Accès au socket Docker                | Jamais monté directement — routé via `docker-socket-proxy`, `EXEC`/`CONTAINERS` bloqués                        | Montage direct du socket (typique)                 | Montage direct du socket (typique) | Montage direct du socket (typique) | Sans objet (API Kubernetes)                                   |
+| Résilience de l'état désiré           | **Oui** — les labels Docker sont la source de vérité ; `rebuildFromDocker` en un clic                          | Dépendante de la base de données                   | Dépendante de la base de données   | Dépendante de la base de données   | Basée sur etcd (K8s)                                          |
+| RBAC avec délégation                  | 3 rôles intégrés (`viewer`/`operator`/`owner`), audités                                                        | Disponible (équipes/rôles)                         | Limité                             | Non intégré                        | RBAC complet (natif K8s, plus lourd à opérer)                 |
+| Auto-scaling intégré                  | **Oui** — basé sur le CPU, puisque Swarm n'en a pas nativement                                                 | Non                                                | Non                                | Non                                | Oui (natif à K8s)                                             |
+| Journal d'audit                       | **Oui** — chaque action sensible, consultable dans l'application                                               | Limité                                             | Limité                             | Non                                | Dépend de la distribution                                     |
+| Complexité opérationnelle             | Faible — un VPS pour démarrer, évolue vers un cluster Swarm                                                    | Faible                                             | Faible                             | Faible                             | Élevée (control plane K8s complet)                            |
+| Licence                               | MIT                                                                                                            | Business Source License (la CE a des restrictions) | Apache 2.0                         | Apache 2.0                         | Apache 2.0                                                    |
+
+### Comment lire ce tableau
+
+- **Portainer** est le plus proche en termes de périmètre (cible aussi Docker/
+  Swarm), mais reste fondamentalement une interface _liste-et-formulaires_ sur
+  l'API Docker — il ne modélise ni un graphe de topologie, ni un workflow
+  plan-avant-application.
+- **Coolify** et **CapRover** optimisent pour un usage très différent : des
+  déploiements rapides, façon Heroku, d'une application unique sur un serveur
+  unique depuis un push Git. Ils excellent dans ce domaine, mais aucun des deux ne
+  cible le clustering Swarm multi-nœuds, la MFA par défaut, ou une topologie
+  réseau visuelle.
+- **Rancher** résout un sur-ensemble de ces problèmes, mais seulement si vous
+  êtes prêt à exploiter Kubernetes — un engagement opérationnel nettement plus
+  lourd qu'un cluster Swarm pour une petite équipe ou un opérateur solo.
+
+### Où Hullbay n'est _pas_ le bon choix
+
+Dans un souci d'honnêteté :
+
+- Si vous êtes déjà engagé sur Kubernetes, Rancher (ou Lens, ArgoCD, etc.) reste
+  le choix le plus mature — Hullbay ne cible pas K8s.
+- Si vous voulez l'expérience « push pour déployer » la plus rapide possible pour
+  une seule application sur un seul serveur avec du CI basé sur Git intégré,
+  Coolify ou CapRover peuvent vous y amener avec moins de configuration initiale.
+- Hullbay suppose que vous êtes à l'aise à penser en termes de conteneurs,
+  réseaux et volumes comme concepts de premier ordre — il n'abstrait pas Docker à
+  la manière d'un PaaS pur.
