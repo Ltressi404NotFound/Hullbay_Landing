@@ -1,53 +1,9 @@
----
-sidebar_position: 2
+﻿---
+id: Démarrage
+title: Démarrage
+sidebar_label: Démarrage
 ---
 
 # Démarrage
 
-### Premier projet
-
-Tutoriel guidé pour créer et déployer sa première application en 5 minutes.
-
-### Prérequis
-
-Liste des logiciels et ressources nécessaires avant d'installer Hullbay.
-
-- **Node.js 20** ou supérieur avec `npm`
-- Un démon **Docker** local
-- **PostgreSQL** et **Redis** pour le développement local
-
-### Installation rapide
-
-Procédure express pour déployer Hullbay en production en quelques commandes.
-
-```bash
-docker compose up -d postgres redis
-```
-
-### Mettre en place les variables d'environnement
-
-```bash
-cp .env.template .env
-
-# Generate the master secrets
-openssl rand -hex 32   # -> JWT_SECRET
-openssl rand -hex 32   # -> MFA_ENCRYPTION_KEY
-```
-
-### Installation des dépendances et mise en place de la base de données
-
-```bash
-npm install
-npm run prisma:generate --workspace @hullbay/api
-npm run prisma:migrate --workspace @hullbay/api
-```
-
-### Démarrage des serveurs en Local
-
-```bash
-npm run predev --workspace @hullbay/shared
-npm run dev --workspace @hullbay/api
-npm run dev --workspace @hullbay/web
-```
-
-The web app runs on port `5273` and calls the API on port `4000`. The first launch of the UI should guide you through the bootstrap flow to create the initial owner account.
+Rédigez votre contenu ici. Utilisez les admonitions :::info et :::tip pour structurer votre documentation.
